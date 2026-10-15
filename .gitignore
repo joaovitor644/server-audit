@@ -1,0 +1,26 @@
+# Estado dos servidores
+state/
+
+# Relatórios
+reports/
+
+# Logs
+logs/
+
+# Arquivos temporários
+*.tmp
+
+# Arquivos de ambiente/configuração local
+.env
+.env.*
+
+# Backup
+*.bak
+*.backup
+
+# Arquivos temporários do editor
+*.swp
+*.swo
+
+# Diretórios temporários
+tmp/
