@@ -101,6 +101,114 @@ _issues_storage() {
 }
 
 # ---------------------------------------------------------------------------
+# Sistema
+# ---------------------------------------------------------------------------
+
+_render_system() {
+  jq -r --argjson mw "${MEM_WARN_PCT:-85}" '
+    def dur:
+      floor as $s
+      | ($s / 86400 | floor) as $d
+      | (($s % 86400) / 3600 | floor) as $h
+      | (($s % 3600) / 60 | floor) as $m
+      | if $d > 0 then "\($d)d \($h)h"
+        elif $h > 0 then "\($h)h \($m)min"
+        else "\($m)min" end;
+
+    .system as $s
+    | "| Item | Valor |",
+      "|---|---|",
+      "| Hostname | `\($s.hostname // "?")` |",
+      "| Sistema | \($s.os.pretty // "?") |",
+      "| Kernel | \($s.kernel // "?") |",
+      "| Arquitetura | \($s.arch // "?") |",
+      "| Uptime | \(if $s.uptime_seconds == null then "?" else ($s.uptime_seconds | dur) end) |",
+      "| CPU | \($s.cpu.model // "?") (\($s.cpu.cores // "?") \(if $s.cpu.cores == 1 then "núcleo" else "núcleos" end)) |",
+      "| Carga (1/5/15 min) | \(($s.cpu.load // []) | map(. // "?" | tostring) | join(" / ")) |",
+      "| Memória | \(
+          if $s.memory.used_pct == null then "?"
+          else "\($s.memory.used_mb) MB de \($s.memory.total_mb) MB (\($s.memory.used_pct)%) \(if $s.memory.used_pct >= $mw then "🟡" else "🟢" end)"
+          end) |",
+      "| Swap | \(
+          if $s.swap.total_mb == null then "?"
+          elif $s.swap.total_mb == 0 then "sem swap"
+          else "\($s.swap.used_mb) MB de \($s.swap.total_mb) MB (\($s.swap.used_pct)%)"
+          end) |"
+  ' "$1"
+}
+
+_issues_system() {
+  jq -r --argjson mw "${MEM_WARN_PCT:-85}" '
+    .system.memory.used_pct as $p
+    | if $p != null and $p >= $mw
+      then "1\tMemória em uso elevado: \($p)% (limite de atenção: \($mw)%)"
+      else empty end
+  ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Serviços
+#   🔴 failed, ou parado embora habilitado; 🟡 em transição;
+#   sem alarme: inativo e desabilitado, mascarado ou não instalado.
+# ---------------------------------------------------------------------------
+
+_SERVICES_JQ_DEFS='
+def trans: (.active // "") | IN("activating", "deactivating", "reloading");
+def should_run: (.enabled // "") | startswith("enabled");
+def svc_sev:
+  if .load == null or .load == "not-found" or .load == "masked" then 0
+  elif .active == "failed" then 2
+  elif .active == "active" then 0
+  elif trans then 1
+  elif should_run then 2
+  else 0 end;
+def svc_label:
+  if .load == null then "desconhecido"
+  elif .load == "not-found" then "não instalado"
+  elif .load == "masked" then "mascarado"
+  elif .active == "active" then "🟢 ativo"
+  elif .active == "failed" then "🔴 failed"
+  elif trans then "🟡 \(.active)"
+  elif should_run then "🔴 parado (habilitado)"
+  else "inativo (desabilitado)" end;
+'
+
+_render_services() {
+  jq -r "$_SERVICES_JQ_DEFS"'
+    .services as $s
+    | ($s.monitored // []) as $m
+    | (
+        if ($m | length) == 0 then "Nenhum serviço monitorado."
+        else
+          "| Serviço | Estado |",
+          "|---|---|",
+          ( $m[] | "| \(.name) | \(svc_label) |" )
+        end
+      ),
+      "", "### Serviços em falha", "",
+      ( if (($s.failed // []) | length) == 0 then "Nenhum serviço em falha."
+        else ($s.failed[] | "- `\(.).service`") end )
+  ' "$1"
+}
+
+_issues_services() {
+  jq -r "$_SERVICES_JQ_DEFS"'
+    .services as $s
+    | ($s.monitored // []) as $m
+    | (
+        ( $m[] | select(svc_sev > 0)
+          | "\(svc_sev)\tServiço `\(.name)` \(
+              if .active == "failed" then "em estado failed"
+              elif trans then "em transição (\(.active))"
+              else "parado (habilitado)" end)" ),
+        ( ($s.failed // [])[] as $u
+          | select(($m | map(.name) | index($u)) == null)
+          | "1\tServiço `\($u).service` em falha" )
+      )
+  ' "$1"
+}
+
+# ---------------------------------------------------------------------------
 # Relatório
 # ---------------------------------------------------------------------------
 

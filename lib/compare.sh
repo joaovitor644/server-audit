@@ -11,10 +11,12 @@
 # Para adicionar uma seção nova: crie _compare_<coletor> (imprime as linhas
 # "- ...", uma por mudança) e inclua o nome em _COMPARE_SECTIONS.
 
-_COMPARE_SECTIONS=(storage)
+_COMPARE_SECTIONS=(system storage services)
 
 declare -A _COMPARE_TITLE=(
+  [system]="Sistema"
   [storage]="Armazenamento"
+  [services]="Serviços"
 )
 
 _compare_storage() {
@@ -41,6 +43,54 @@ _compare_storage() {
             ( ($om | keys[]) as $m
               | select($nm[$m] == null)
               | "- Filesystem removido: `\($m)`" )
+          )
+      end
+  ' || return 1
+}
+
+_compare_system() {
+  local old="$1" new="$2"
+  jq -r -n --slurpfile a "$old" --slurpfile b "$new" '
+    ($a[0].system // {}) as $o
+    | ($b[0].system // {}) as $n
+    | if ($o.available != true) or ($n.available != true) then empty
+      else
+        ( if ($o.boot_epoch != null and $n.boot_epoch != null
+              and (($n.boot_epoch - $o.boot_epoch) | fabs) > 120)
+          then "- Reinicialização detectada (último boot: \($n.boot_epoch | strftime("%Y-%m-%d %H:%M UTC")))"
+          else empty end ),
+        ( if $o.kernel != $n.kernel
+          then "- Kernel: `\($o.kernel)` → `\($n.kernel)`" else empty end ),
+        ( if $o.os.pretty != $n.os.pretty
+          then "- Sistema: \($o.os.pretty) → \($n.os.pretty)" else empty end ),
+        ( if $o.cpu.cores != $n.cpu.cores
+          then "- Núcleos de CPU: \($o.cpu.cores) → \($n.cpu.cores)" else empty end ),
+        ( if $o.memory.total_mb != $n.memory.total_mb
+          then "- Memória total: \($o.memory.total_mb) MB → \($n.memory.total_mb) MB" else empty end )
+      end
+  ' || return 1
+}
+
+_compare_services() {
+  local old="$1" new="$2"
+  jq -r -n --slurpfile a "$old" --slurpfile b "$new" '
+    ($a[0].services // {}) as $o
+    | ($b[0].services // {}) as $n
+    | if ($o.available != true) or ($n.available != true) then empty
+      else
+        (($o.monitored // []) | map({(.name): .}) | add // {}) as $om
+        | (($n.monitored // []) | map({(.name): .}) | add // {}) as $nm
+        | ($nm | keys) as $mon
+        | (
+            ( ($nm | keys[]) as $s
+              | select($om[$s] != null and $om[$s].active != $nm[$s].active)
+              | "- `\($s)`: \($om[$s].active) → \($nm[$s].active)" ),
+            ( ($n.failed // [])[] as $u
+              | select(($mon | index($u)) == null and ((($o.failed // []) | index($u)) == null))
+              | "- `\($u).service` passou para o estado `failed`" ),
+            ( ($o.failed // [])[] as $u
+              | select(($mon | index($u)) == null and ((($n.failed // []) | index($u)) == null))
+              | "- `\($u).service` não está mais em falha" )
           )
       end
   ' || return 1
