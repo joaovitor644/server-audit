@@ -45,6 +45,9 @@ def sev($f):
      or ($f.inode_used_pct // 0) >= $iw then 1
   else 0 end;
 def icon: if . == 2 then "🔴" elif . == 1 then "🟡" else "🟢" end;
+def fmtgb: if . == null then "?"
+           elif . >= 1024 then "\((. / 1024 * 10 | round) / 10) TB"
+           else "\(.) GB" end;
 '
 
 # _storage_jq ARQUIVO_ESTADO FILTRO   (saída crua, como jq -r)
@@ -68,13 +71,13 @@ _render_storage() {
           "|---|---:|---:|---:|---|",
           ( $fs | sort_by(.mount)[]
             | sev(.) as $v
-            | "| `\(.mount)` | \(.used_pct // "?")% | \(if .inode_used_pct == null then "—" else "\(.inode_used_pct)%" end) | \(.avail_gb) GB | \($v | icon)\(if .readonly == true then " somente leitura" else "" end) |" )
+            | "| `\(.mount)` | \(.used_pct // "?")% | \(if .inode_used_pct == null then "—" else "\(.inode_used_pct)%" end) | \(.avail_gb | fmtgb) | \($v | icon)\(if .readonly == true then " somente leitura" else "" end) |" )
         end
       ),
       ( ($s.devices // []) as $d
         | if ($d | length) > 0 then
             "", "### Dispositivos", "",
-            ( $d[] | "- `\(.name)`: \((.size_bytes / 1073741824 * 10 | round) / 10) GB\(if .model then " — \(.model)" else "" end)" )
+            ( $d[] | "- `\(.name)`: \((.size_bytes / 1073741824 * 10 | round) / 10 | fmtgb)\(if .model then " — \(.model)" else "" end)" )
           else empty end )
   '
 }
@@ -209,17 +212,258 @@ _issues_services() {
 }
 
 # ---------------------------------------------------------------------------
+# Rede
+#   🔴 sem rota padrão, ou interface da rota padrão em down.
+# ---------------------------------------------------------------------------
+
+_render_network() {
+  jq -r '
+    def stext: if .scope == "all" then "todas as interfaces"
+               elif .scope == "local" then "somente local" else .addr end;
+
+    .network as $n
+    | ($n.default_routes // []) as $dr
+    | ($dr | map(.dev)) as $prim
+    | "### Interfaces", "",
+      "| Interface | Estado | Endereços |", "|---|---|---|",
+      ( ($n.interfaces // [])[] as $i
+        | "| `\($i.name)` | \(
+            if $i.state == "up" then "🟢 up"
+            elif $i.state == "down" and (($prim | index($i.name)) != null) then "🔴 down"
+            else $i.state end) | \(
+            if ($i.addresses | length) == 0 then "—"
+            else ($i.addresses | map("`\(.)`") | join(", ")) end) |" ),
+      "",
+      "**Gateway padrão:** \(
+        if ($dr | length) == 0 then "nenhum"
+        else ($dr | map("`\(.gateway // "—")` via `\(.dev)`") | join(", ")) end)",
+      "",
+      "**DNS:** \(
+        if ($n.dns.servers | length) == 0 then "não identificado"
+        else (($n.dns.servers | map("`\(.)`") | join(", "))
+              + (if $n.dns.source then " (\($n.dns.source))" else "" end)) end)",
+      "", "### Portas em escuta", "",
+      ( if $n.listening == null then "Não foi possível listar as portas (ss indisponível)."
+        elif ($n.listening | length) == 0 then "Nenhuma porta em escuta."
+        else
+          "| Protocolo | Porta | Escopo |", "|---|---:|---|",
+          ( $n.listening
+            | group_by([.proto, .port, .scope])
+            | map({ proto: .[0].proto, port: .[0].port, scope: .[0].scope,
+                    addr: (map(.addr) | unique | join(", ")) })
+            | sort_by(.port, .proto)[]
+            | "| \(.proto) | \(.port) | \(stext) |" )
+        end )
+  ' "$1"
+}
+
+_issues_network() {
+  jq -r '
+    .network as $n
+    | ($n.default_routes // []) as $dr
+    | ( if ($dr | length) == 0
+        then "2\tNenhuma rota padrão configurada (rede principal indisponível)" else empty end ),
+      ( ($n.interfaces // [])[] as $i
+        | select((($dr | map(.dev) | index($i.name)) != null) and $i.state == "down")
+        | "2\tInterface principal `\($i.name)` está down" )
+  ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Docker
+#   🔴 container essencial (DOCKER_ESSENTIAL) parado ou inexistente;
+#   🟡 reiniciando, unhealthy, encerrado com erro, pausado ou dead.
+# ---------------------------------------------------------------------------
+
+_DOCKER_JQ_DEFS='
+def isess($ess): .name as $n | ($ess | index($n)) != null;
+def csev($ess):
+  if isess($ess) and .state != "running" then 2
+  elif .state == "restarting" or .restarting == true then 1
+  elif .health == "unhealthy" then 1
+  elif .state == "dead" or .state == "paused" then 1
+  elif .state == "exited" and ((.exit_code // 0) != 0) then 1
+  else 0 end;
+def clabel($ess):
+  csev($ess) as $v
+  | (if .state == "running" then "Up\(if .health != null then " (\(.health))" else "" end)"
+     elif .state == "restarting" or .restarting == true then "reiniciando"
+     elif .state == "exited" then "Exited (\(.exit_code))"
+     else .state end) as $t
+  | (if $v == 2 then "🔴" elif $v == 1 then "🟡" elif .state == "running" then "🟢" else "" end) as $i
+  | [$i, $t] | map(select(. != "")) | join(" ");
+'
+
+_docker_essential_json() {
+  local -a ess=()
+  read -r -a ess <<<"${DOCKER_ESSENTIAL:-}"
+  jq -nc '$ARGS.positional' --args "${ess[@]}"
+}
+
+_render_docker() {
+  jq -r --argjson ess "$(_docker_essential_json)" "$_DOCKER_JQ_DEFS"'
+    .docker as $d
+    | ($d.containers // []) as $c
+    | ( if ($c | length) == 0 then "Nenhum container."
+        else
+          "| Container | Estado | Imagem |", "|---|---|---|",
+          ( $c | sort_by(.name)[] | "| \(.name) | \(clabel($ess)) | \(.image) |" )
+        end ),
+      "",
+      "Imagens: \($d.images.count) (\($d.images.dangling) sem tag) · Volumes: \($d.volumes.count) (\($d.volumes.dangling) órfãos) · Redes: \($d.networks.count)"
+  ' "$1"
+}
+
+_issues_docker() {
+  jq -r --argjson ess "$(_docker_essential_json)" "$_DOCKER_JQ_DEFS"'
+    .docker as $d
+    | ($d.containers // []) as $c
+    | ( ( $c[] | select(csev($ess) > 0)
+          | "\(csev($ess))\tContainer \(if isess($ess) then "essencial " else "" end)`\(.name)` \(
+              if isess($ess) and .state != "running" then "não está em execução (estado: \(.state))"
+              elif .state == "restarting" or .restarting == true then "reiniciando (\(.restart_count // 0) reinícios)"
+              elif .health == "unhealthy" then "com healthcheck falhando (unhealthy)"
+              elif .state == "exited" then "encerrou com erro (código \(.exit_code))"
+              else "em estado \(.state)" end)" ),
+        ( $ess[] as $e
+          | select(($c | map(.name) | index($e)) == null)
+          | "2\tContainer essencial `\($e)` não encontrado" ) )
+  ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Segurança
+#   🔴 SSH com senhas vazias, conta extra com UID 0;
+#   🟡 firewall inativo ou desconhecido, SSH com login root/senha habilitado.
+# ---------------------------------------------------------------------------
+
+_render_security() {
+  jq -r '
+    def names($a): if ($a | length) == 0 then "nenhum"
+                   else ($a | map("`\(.)`") | join(", ")) end;
+    def flag($v; $bad; $icon): if $v == $bad then " \($icon)" else "" end;
+
+    .security as $s
+    | "### Firewall", "",
+      ( if $s.firewall.tool == "none"
+        then "- ufw não instalado (nenhum firewall gerenciado por ufw detectado)"
+        else
+          "- Firewall (ufw): \(
+            if $s.firewall.status == "active" then "🟢 ativo"
+            elif $s.firewall.status == "inactive" then "🟡 inativo"
+            else "🟡 desconhecido (sem permissão; configure o sudoers)" end)",
+          ( if $s.firewall.default_incoming != null
+            then "- Política padrão de entrada: \($s.firewall.default_incoming)" else empty end ),
+          ( if ($s.firewall.rules | length) > 0
+            then "- Regras:", ($s.firewall.rules[] | "  - `\(.)`") else empty end )
+        end ),
+      "", "### SSH", "",
+      ( if $s.ssh.present != true then "Configuração do sshd não encontrada."
+        else
+          "| Opção | Valor |", "|---|---|",
+          "| Porta | \($s.ssh.port | map(tostring) | join(", ")) |",
+          "| PermitRootLogin | \($s.ssh.permit_root_login)\(flag($s.ssh.permit_root_login; "yes"; "🟡")) |",
+          "| PasswordAuthentication | \($s.ssh.password_authentication)\(flag($s.ssh.password_authentication; "yes"; "🟡")) |",
+          "| PubkeyAuthentication | \($s.ssh.pubkey_authentication) |",
+          "| PermitEmptyPasswords | \($s.ssh.permit_empty_passwords)\(flag($s.ssh.permit_empty_passwords; "yes"; "🔴")) |",
+          "| X11Forwarding | \($s.ssh.x11_forwarding) |"
+        end ),
+      "", "### Usuários", "",
+      "- Com shell de login: \(names($s.users.with_shell | map(.name)))",
+      "- Administradores (sudo/admin/wheel): \(names($s.users.admins))",
+      ( if ($s.users.uid0_extra | length) > 0
+        then "- 🔴 Contas com UID 0 além de root: \(names($s.users.uid0_extra))" else empty end ),
+      "", "### Tentativas de autenticação SSH", "",
+      ( if $s.auth.available != true
+        then "Indisponível: \($s.auth.reason // "sem detalhes")."
+        else "- Últimos \($s.auth.window_days) dias: \($s.auth.failed) falhas (\($s.auth.unique_sources) origens distintas) e \($s.auth.accepted) logins aceitos"
+        end ),
+      "", "### Proteções complementares", "",
+      "- fail2ban: \(
+        if $s.protections.fail2ban == "active" then "🟢 ativo"
+        elif $s.protections.fail2ban == "inactive" then "inativo"
+        elif $s.protections.fail2ban == "not-installed" then "não instalado"
+        else "desconhecido" end)",
+      "- unattended-upgrades: \(
+        if $s.protections.unattended_upgrades == null then "desconhecido"
+        elif $s.protections.unattended_upgrades then "instalado" else "não instalado" end)"
+  ' "$1"
+}
+
+_issues_security() {
+  jq -r '
+    .security as $s
+    | ( if $s.firewall.status == "inactive" then "1\tFirewall (ufw) inativo" else empty end ),
+      ( if $s.firewall.tool == "ufw" and $s.firewall.status == "unknown"
+        then "1\tEstado do firewall (ufw) desconhecido: sem permissão para consultar (veja a seção Permissões do README)"
+        else empty end ),
+      ( if $s.ssh.present == true then
+          ( if $s.ssh.permit_empty_passwords == "yes"
+            then "2\tSSH permite senhas vazias (PermitEmptyPasswords yes)" else empty end ),
+          ( if $s.ssh.permit_root_login == "yes"
+            then "1\tSSH permite login direto como root com senha (PermitRootLogin yes)" else empty end ),
+          ( if $s.ssh.password_authentication == "yes"
+            then "1\tSSH aceita autenticação por senha (PasswordAuthentication yes)" else empty end )
+        else empty end ),
+      ( ($s.users.uid0_extra // [])[] | "2\tConta `\(.)` com UID 0 além de root" )
+  ' "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Atualizações
+#   🟡 pacotes pendentes, reinicialização pendente, índice do apt velho.
+# ---------------------------------------------------------------------------
+
+_render_updates() {
+  jq -r --argjson cw "${UPDATES_CACHE_WARN_DAYS:-14}" --argjson uw "${UPDATES_WARN_COUNT:-1}" '
+    .updates as $u
+    | ( if $u.pending == 0 then "Nenhum pacote pendente."
+        elif $u.pending == 1 then "1 pacote pode ser atualizado."
+        else "\($u.pending) pacotes podem ser atualizados." end ),
+      ( if $u.security > 0 then "", "Atualizações de segurança: \($u.security)." else empty end ),
+      "", "### Situação", "",
+      ( if $u.pending > 0 and $u.pending >= $uw then "🟡 Atualizações pendentes" else "🟢 Em dia" end ),
+      "",
+      "- Reinicialização necessária: \(if $u.reboot_required then "sim 🟡" else "não" end)",
+      "- Índice de pacotes (apt) atualizado: \(
+        if $u.cache_age_days == null then "data desconhecida"
+        elif $u.cache_age_days == 0 then "hoje"
+        else "há \($u.cache_age_days) dia(s)\(if $u.cache_age_days > $cw then " 🟡" else "" end)" end)",
+      ( ($u.security_packages + ($u.packages - $u.security_packages)) as $all
+        | if ($all | length) > 0 then
+            "", "### Pacotes", "",
+            ( ($all[:20] | map("`\(.)`") | join(", "))
+              + (if ($all | length) > 20 then " (e mais \(($all | length) - 20))" else "" end) )
+          else empty end )
+  ' "$1"
+}
+
+_issues_updates() {
+  jq -r --argjson cw "${UPDATES_CACHE_WARN_DAYS:-14}" --argjson uw "${UPDATES_WARN_COUNT:-1}" '
+    .updates as $u
+    | ( if $u.pending > 0 and $u.pending >= $uw
+        then "1\t\($u.pending) \(if $u.pending == 1 then "pacote com atualização pendente" else "pacotes com atualização pendente" end)\(if $u.security > 0 then " (\($u.security) de segurança)" else "" end)"
+        else empty end ),
+      ( if $u.reboot_required then "1\tReinicialização do servidor pendente" else empty end ),
+      ( if $u.cache_age_days != null and $u.cache_age_days > $cw
+        then "1\tÍndice de pacotes (apt) desatualizado há \($u.cache_age_days) dias; a contagem de pendências pode estar incorreta"
+        else empty end )
+  ' "$1"
+}
+
+# ---------------------------------------------------------------------------
 # Relatório
 # ---------------------------------------------------------------------------
 
 render_report() {
   local host="$1" state="$2" changes="$3"
   local name status collected_at worst=0 sev msg detail
-  local -a issue_sev=() issue_msg=()
+  local -a issue_sev=() issue_msg=() failed_names=()
 
   # --- problemas: coletores com falha + problemas de cada seção ---
   while IFS=$'\t' read -r name detail; do
     [[ -n $name ]] || continue
+    failed_names+=("$name")
     issue_sev+=(1)
     issue_msg+=("Coletor \`$name\` falhou: $detail")
   done < <(jq -r '. as $s | (.failed_collectors // [])[] | "\(.)\t\($s[.].error // "sem detalhes")"' "$state")
@@ -228,6 +472,16 @@ render_report() {
     status="$(jq -r --arg k "$name" \
       'if has($k) then (if .[$k].available == false then "unavailable" else "ok" end) else "absent" end' \
       "$state")"
+    if [[ $status == unavailable ]]; then
+      # "reason" = ausência esperada (sem alarme); "error" = problema real
+      detail="$(jq -r --arg k "$name" \
+        'if .[$k].reason == null and .[$k].error != null then .[$k].error else "" end' "$state")"
+      if [[ -n $detail && " ${failed_names[*]:-} " != *" $name "* ]]; then
+        issue_sev+=(1)
+        issue_msg+=("Seção \`$name\` indisponível: $detail")
+      fi
+      continue
+    fi
     [[ $status == ok ]] || continue
     declare -F "_issues_$name" >/dev/null || continue
     while IFS=$'\t' read -r sev msg; do

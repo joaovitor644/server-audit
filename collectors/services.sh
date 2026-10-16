@@ -6,7 +6,7 @@
 # Contrato dos coletores:
 #   - emite UM objeto JSON na saída padrão
 #   - somente leitura: só consulta (`systemctl show` / `list-units`)
-#   - sem systemd => {"available": false, "error": "..."} e saída 0
+#   - sem systemd => {"available": false, "reason": "..."} e saída 0
 #
 # Quais serviços são monitorados:
 #   - os listados em config/services.conf (um por linha, '#' para comentários);
@@ -31,9 +31,14 @@ unavailable() {
   exit 0
 }
 
+not_applicable() {
+  printf '{"available": false, "reason": "%s"}\n' "$1"
+  exit 0
+}
+
 command -v jq >/dev/null 2>&1        || unavailable "jq não encontrado"
-command -v systemctl >/dev/null 2>&1 || unavailable "systemctl não encontrado"
-[[ -d /run/systemd/system ]]         || unavailable "systemd não está em execução"
+command -v systemctl >/dev/null 2>&1 || not_applicable "systemctl não encontrado"
+[[ -d /run/systemd/system ]]         || not_applicable "systemd não está em execução"
 
 DEFAULT_SERVICES=(ssh docker nginx cron)
 
