@@ -6,7 +6,7 @@ O objetivo é fornecer uma visão consolidada do estado atual de cada servidor e
 
 Servidores atendidos inicialmente: `kait` e `kara`.
 
-🚧 **Status:** em desenvolvimento (definição da arquitetura e implementação do MVP). A primeira versão será validada no `kait` antes de ser usada nos demais servidores.
+🚧 **Status:** código das Fases 1 (MVP), 2 (histórico) e 3 (automação) escrito e testado em ambiente de teste. Falta validar em um servidor real, começando pelo `kait`.
 
 ---
 
@@ -15,6 +15,7 @@ Servidores atendidos inicialmente: `kait` e `kara`.
 - [Objetivos](#objetivos)
 - [Como funciona](#como-funciona)
 - [Instalação e uso](#instalação-e-uso)
+- [Agendamento semanal (systemd)](#agendamento-semanal-systemd)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Coletores](#coletores)
 - [Estado e comparação histórica](#estado-e-comparação-histórica)
@@ -22,7 +23,9 @@ Servidores atendidos inicialmente: `kait` e `kara`.
 - [Classificação de severidade](#classificação-de-severidade)
 - [Permissões](#permissões)
 - [Requisitos](#requisitos)
+- [Como adicionar um coletor](#como-adicionar-um-coletor)
 - [Princípios do projeto](#princípios-do-projeto)
+- [Limitações conhecidas](#limitações-conhecidas)
 - [Roadmap](#roadmap)
 
 ---
@@ -40,13 +43,13 @@ Servidores atendidos inicialmente: `kait` e `kara`.
 
 ## Como funciona
 
-Cada coletor emite **dados estruturados (JSON)**. O `audit.sh` junta a saída de todos em um único estado, compara com o estado da execução anterior e só então gera o Markdown. O estado novo é gravado ao final.
+Cada coletor emite **dados estruturados (JSON)**. O `audit.sh` junta a saída de todos em um único estado, compara com o estado da execução anterior e só então gera o Markdown. O estado novo é gravado por último, e só se o relatório foi gerado.
 
 ```text
 ┌───────────────────┐
 │     audit.sh      │
 └─────────┬─────────┘
-          │ executa cada coletor
+          │ executa cada coletor (com tempo limite)
           ▼
 ┌───────────────────┐
 │    collectors/    │  system · storage · network · services
@@ -76,20 +79,10 @@ Cada coletor emite **dados estruturados (JSON)**. O `audit.sh` junta a saída de
 - é um script Bash executável em `collectors/<nome>.sh`;
 - imprime **um objeto JSON** na saída padrão;
 - nunca altera o sistema;
-- se a ferramenta necessária não existir, **não falha**: emite `{"available": false}`;
-- termina com código `0`, exceto em erro inesperado (o `audit.sh` registra e segue com os demais).
-
-Exemplo de saída do coletor de armazenamento:
-
-```json
-{
-  "available": true,
-  "filesystems": [
-    { "mount": "/", "used_pct": 42, "avail_gb": 55 },
-    { "mount": "/mnt/storage", "used_pct": 71, "avail_gb": 135 }
-  ]
-}
-```
+- se a ferramenta necessária não existir, **não falha**: emite `{"available": false, ...}` e sai com código `0`:
+  - `"reason"` indica ausência esperada (`"não instalado"`, `"systemd não está em execução"`): a seção mostra o motivo, sem alarme;
+  - `"error"` indica problema real (`"sem permissão para acessar o Docker"`): a seção aparece com 🟡 no resumo;
+- se o coletor travar, sair com erro ou imprimir JSON inválido, o `audit.sh` registra o erro, marca o coletor em `failed_collectors` e segue com os demais.
 
 ---
 
@@ -100,16 +93,87 @@ git clone <url-do-repositorio> server-audit
 cd server-audit
 chmod +x audit.sh collectors/*.sh
 
+./audit.sh --dry-run       # imprime o relatório; não grava nada
 ./audit.sh                 # audita a máquina atual
-./audit.sh --host kait     # força o nome usado em state/ e reports/
 ```
 
-- **Nome do servidor:** por padrão vem de `hostname -s`; `--host` sobrescreve.
-- **Saídas:** relatório em `reports/<host>/`, estado em `state/<host>.json`, log em `logs/audit.log`.
-- **Mais de uma execução no mesmo dia:** o primeiro relatório do dia é `AAAA-MM-DD.md`; as seguintes ganham sufixo de hora (`AAAA-MM-DD_HHMM.md`). Nenhum relatório é sobrescrito.
-- **Primeira execução:** sem estado anterior, o relatório indica "sem base de comparação" e apenas grava o estado inicial.
+Opções:
 
-> ⚠️ `reports/`, `state/` e `logs/` contêm IPs, portas, usuários e containers dos servidores. Estão no `.gitignore` e **não devem ser versionados** (principalmente se o repositório for público).
+| Opção | O que faz |
+|---|---|
+| `--host NOME` | nome usado em `state/` e `reports/` (padrão: `hostname -s`) |
+| `--only a,b` | executa só os coletores indicados (ex.: `--only storage,updates`) |
+| `--dry-run` | imprime o relatório na saída padrão; não grava relatório, estado nem log |
+| `--version` | mostra a versão |
+
+Variável de ambiente: `COLLECTOR_TIMEOUT` (segundos por coletor, padrão `30`).
+
+**Códigos de saída:**
+
+| Código | Significado |
+|---|---|
+| `0` | relatório gerado, sem problemas na execução |
+| `1` | erro fatal (relatório não gerado) |
+| `2` | relatório gerado, mas algum coletor ou a comparação falhou |
+
+**Comportamento:**
+
+- **Mais de uma execução no mesmo dia:** a primeira gera `AAAA-MM-DD.md`; as seguintes ganham sufixo de hora (`AAAA-MM-DD_HHMM.md`). Nenhum relatório é sobrescrito.
+- **Primeira execução:** sem estado anterior, o relatório indica "sem base de comparação" e apenas grava o estado inicial.
+- **Execuções simultâneas** para o mesmo servidor são bloqueadas (`flock`).
+- Arquivos gerados usam permissão `600` (`umask 077`).
+
+> ⚠️ `reports/`, `state/` e `logs/` contêm IPs, portas, usuários, containers e regras de firewall. Estão no `.gitignore` e **não devem ser versionados**, principalmente se o repositório for público.
+
+---
+
+## Agendamento semanal (systemd)
+
+Os arquivos estão em `systemd/`. O timer roda toda segunda-feira às 06:00, com atraso aleatório de até 15 minutos, e `Persistent=true` (se o servidor estava desligado, executa ao ligar).
+
+```bash
+# 1. usuário dedicado, sem login
+sudo useradd --system --home-dir /opt/server-audit --shell /usr/sbin/nologin audit
+
+# 2. instalar o projeto
+sudo mkdir -p /opt/server-audit
+sudo cp -r audit.sh collectors lib config systemd README.md /opt/server-audit/
+sudo chown -R root:root /opt/server-audit
+sudo chmod -R go+rX /opt/server-audit
+sudo install -d -o audit -g audit -m 700 \
+  /opt/server-audit/state /opt/server-audit/reports /opt/server-audit/logs
+
+# 3. permissão para o firewall (veja "Permissões")
+echo 'audit ALL=(root) NOPASSWD: /usr/sbin/ufw status verbose' \
+  | sudo tee /etc/sudoers.d/server-audit
+sudo chmod 440 /etc/sudoers.d/server-audit
+sudo visudo -c -f /etc/sudoers.d/server-audit
+
+# 4. teste manual, como o usuário de auditoria
+sudo -u audit /opt/server-audit/audit.sh --dry-run
+
+# 5. ativar o timer
+sudo cp systemd/server-audit.service systemd/server-audit.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now server-audit.timer
+```
+
+Acompanhamento:
+
+```bash
+systemctl list-timers server-audit.timer     # próxima execução
+sudo systemctl start server-audit.service    # executar agora
+journalctl -u server-audit.service           # logs (também em logs/audit.log)
+```
+
+Se algum coletor falhar (código de saída `2`), o `systemd` marca a unidade como falha, e isso aparece em `systemctl --failed`.
+
+Pontos de atenção na unidade:
+
+- `NoNewPrivileges=false` é intencional: o coletor de segurança usa `sudo -n` para consultar o `ufw`. Com `true`, o `sudo` deixaria de funcionar.
+- `SupplementaryGroups=systemd-journal` dá leitura do journal sem `sudo`.
+- A linha do grupo `docker` está comentada de propósito (veja [Permissões](#permissões)).
+- `ProtectSystem=full` e `ProtectHome=true` protegem `/usr`, `/etc` e `/home`; `state/`, `reports/` e `logs/` continuam graváveis.
 
 ---
 
@@ -121,7 +185,8 @@ server-audit/
 ├── .gitignore              # ignora reports/, state/ e logs/
 │
 ├── config/
-│   └── thresholds.conf     # limites de 🟡 Atenção e 🔴 Crítico
+│   ├── thresholds.conf     # limites de 🟡/🔴 e containers essenciais
+│   └── services.conf       # serviços systemd monitorados
 │
 ├── collectors/             # um script por categoria (saída JSON)
 │   ├── system.sh
@@ -132,52 +197,49 @@ server-audit/
 │   ├── security.sh
 │   └── updates.sh
 │
-├── lib/                    # funções compartilhadas
-│   ├── common.sh           # log, checagem de dependências, helpers
-│   ├── compare.sh          # diferença entre estado anterior e atual
-│   └── render.sh           # JSON → relatório Markdown
+├── lib/
+│   ├── compare.sh          # estado anterior × novo → Markdown das mudanças
+│   └── render.sh           # estado → relatório Markdown, com severidade
+│
+├── systemd/
+│   ├── server-audit.service
+│   └── server-audit.timer
 │
 ├── reports/                # histórico (não versionado)
-│   ├── kait/
-│   │   ├── 2026-10-13.md
-│   │   └── ...
-│   └── kara/
-│
+│   └── kait/2026-10-13.md
 ├── state/                  # último estado de cada servidor (não versionado)
-│   ├── kait.json
-│   └── kara.json
-│
+│   └── kait.json
 └── logs/
     └── audit.log           # (não versionado)
 ```
+
+Os coletores são **descobertos automaticamente** em `collectors/*.sh`: adicionar um arquivo novo não exige alterar o `audit.sh`.
 
 ---
 
 ## Coletores
 
-Cada coletor cuida de uma categoria. A tabela separa o que entra no **MVP** do que fica para depois.
-
-| Coletor | MVP | Futuro |
+| Coletor | O que coleta | Observações |
 |---|---|---|
-| `system.sh` | hostname, distribuição e versão, kernel, uptime, CPU, RAM, swap, arquitetura | — |
-| `storage.sh` | filesystems, uso de disco e inodes, espaço disponível, pontos de montagem (incluindo detecção de montagem somente leitura) | dados SMART |
-| `network.sh` | interfaces e estado, endereços IP, rotas, gateway, DNS, portas TCP/UDP em escuta | WireGuard |
-| `services.sh` | estado dos principais serviços `systemd` e lista de serviços em `failed` | serviços específicos por servidor |
-| `docker.sh` | containers e estado, imagens, containers reiniciando ou com problema | volumes, redes |
-| `security.sh` | firewall, configuração relevante do SSH, usuários com shell, tentativas recentes de autenticação | serviços privilegiados, mais indicadores |
-| `updates.sh` | quantidade e lista de pacotes atualizáveis | certificados, backups |
+| `system.sh` | hostname, SO e versão, kernel, arquitetura, uptime, horário do boot, CPU (modelo, núcleos, carga), memória e swap | lê direto de `/proc`; memória "em uso" desconta o cache (`MemAvailable`) |
+| `storage.sh` | filesystems, uso de disco e inodes, espaço disponível, montagem somente leitura, discos | ignora os filesystems `tmpfs`, `squashfs` e `overlay` e os discos `zram` |
+| `network.sh` | interfaces e estado, endereços, rotas, gateway padrão, DNS, portas TCP/UDP em escuta | ignora `lo` e `veth*`; usa `resolvectl` quando existe |
+| `services.sh` | estado dos serviços de `config/services.conf` e lista de serviços em `failed` | padrão: `ssh`, `docker`, `nginx`, `cron` |
+| `docker.sh` | containers (estado, imagem, reinícios, healthcheck), imagens, volumes, redes | Docker ausente: seção diz "não instalado" |
+| `security.sh` | firewall (`ufw`), configuração do SSH, usuários com shell, administradores, tentativas de login SSH (7 dias), fail2ban, unattended-upgrades | veja [Permissões](#permissões) |
+| `updates.sh` | pacotes com atualização pendente, quantos são de segurança, reinicialização pendente, idade do índice do apt | simula `apt-get dist-upgrade`; não instala nada |
 
-O coletor de segurança **não faz alterações no sistema**: apenas coleta e reporta. Da mesma forma, o de atualizações **não instala nada**.
+O coletor de segurança **não faz alterações no sistema**: apenas coleta e reporta. O de atualizações **não instala nada** e não executa `apt-get update`.
 
 Exemplo de seção gerada (armazenamento):
 
 ```markdown
 ## Armazenamento
 
-| Filesystem | Uso | Disponível | Situação |
-|---|---:|---:|---|
-| `/` | 42% | 55 GB | 🟢 |
-| `/mnt/storage` | 71% | 135 GB | 🟢 |
+| Filesystem | Uso | Inodes | Disponível | Situação |
+|---|---:|---:|---:|---|
+| `/` | 42% | 2% | 55 GB | 🟢 |
+| `/mnt/storage` | 71% | 1% | 135 GB | 🟢 |
 ```
 
 Exemplo (Docker):
@@ -185,61 +247,49 @@ Exemplo (Docker):
 ```markdown
 ## Docker
 
-| Container | Estado | Imagem | Situação |
-|---|---|---|---|
-| stirling-pdf | Up | stirlingtools/stirling-pdf | 🟢 |
-| nginx | Up | nginx | 🟢 |
-```
+| Container | Estado | Imagem |
+|---|---|---|
+| nginx | 🟢 Up (healthy) | nginx:1.27 |
+| worker | 🟡 reiniciando | meu/worker |
 
-Quando uma dependência opcional não está presente, a seção aparece assim:
-
-```markdown
-## Docker
-
-Não instalado.
+Imagens: 5 (1 sem tag) · Volumes: 2 (0 órfãos) · Redes: 3
 ```
 
 ---
 
 ## Estado e comparação histórica
 
-O estado é o JSON consolidado da última execução em `state/<host>.json`. Para a comparação detectar o que o relatório promete (novo container, serviço que falhou, queda de pacotes pendentes), o estado guarda **listas e valores**, não apenas contagens:
+O estado é o JSON consolidado da última execução em `state/<host>.json`, com **uma chave por coletor**. Ele guarda listas e valores (não só contagens), o que permite detectar "novo container", "serviço que passou a falhar" ou "porta nova em escuta":
 
 ```json
 {
   "schema": 1,
   "hostname": "kait",
   "collected_at": "2026-10-13T09:00:00-03:00",
-  "storage": {
-    "filesystems": [
-      { "mount": "/", "used_pct": 42 },
-      { "mount": "/mnt/storage", "used_pct": 71 }
-    ]
-  },
-  "memory": { "used_mb": 1840 },
-  "docker": {
-    "containers": ["stirling-pdf", "nginx", "grafana"]
-  },
-  "services": {
-    "failed": []
-  },
-  "updates": {
-    "pending": 12
-  }
+  "failed_collectors": [],
+  "system":   { "available": true, "kernel": "6.1.0-25-amd64", "memory": { "used_pct": 47 } },
+  "storage":  { "available": true, "filesystems": [ { "mount": "/", "used_pct": 42 } ] },
+  "network":  { "available": true, "listening": [ { "proto": "tcp", "port": 22, "scope": "all" } ] },
+  "services": { "available": true, "monitored": [ { "name": "ssh", "active": "active" } ], "failed": [] },
+  "docker":   { "available": false, "reason": "não instalado" },
+  "security": { "available": true, "firewall": { "status": "active" } },
+  "updates":  { "available": true, "pending": 12, "packages": ["libc6", "openssl"] }
 }
 ```
 
 O campo `schema` permite evoluir o formato sem quebrar a comparação com estados antigos.
 
-Exemplo de seção gerada no relatório:
+**Regra da comparação:** uma seção só é comparada se o coletor estava disponível (`"available": true`) nas **duas** execuções. Assim, uma falha temporária ou uma ferramenta opcional ausente não gera "mudanças" falsas (como "todos os containers sumiram").
+
+Exemplo de seção gerada:
 
 ```markdown
 ## Mudanças desde o relatório anterior
 
-### Armazenamento
+### Rede
 
-- `/`: 42% → 47%
-- `/mnt/storage`: 68% → 71%
+- `tcp/5432`: somente local → todas as interfaces
+- Nova porta em escuta: `tcp/8080` (todas as interfaces)
 
 ### Docker
 
@@ -254,6 +304,18 @@ Exemplo de seção gerada no relatório:
 
 - Pacotes pendentes: 12 → 4
 ```
+
+O que cada seção compara:
+
+| Seção | Mudanças detectadas |
+|---|---|
+| Sistema | reinicialização (pelo horário do boot), kernel, SO, núcleos de CPU, memória total |
+| Armazenamento | uso por filesystem, filesystem novo ou removido, passagem para somente leitura |
+| Rede | interfaces, endereços, gateway, DNS, portas novas ou fechadas, mudança de escopo de uma porta |
+| Serviços | mudança de estado, serviços que passaram a falhar ou se recuperaram |
+| Docker | containers novos ou removidos, estado, imagem, contagens de imagens, volumes e redes |
+| Segurança | estado e regras do firewall, opções do SSH, usuários com shell, administradores, UID 0, proteções |
+| Atualizações | pacotes pendentes, pacotes de segurança, reinicialização pendente |
 
 ---
 
@@ -271,7 +333,8 @@ Um relatório por execução, em `reports/<host>/AAAA-MM-DD.md`, preservando o h
 Estrutura:
 
 ```text
-Resumo (severidade geral + itens que precisam de atenção)
+Cabeçalho (servidor, data, situação geral)
+Resumo (problemas ordenados: 🔴 antes de 🟡)
   ├── Sistema
   ├── Armazenamento
   ├── Rede
@@ -282,80 +345,129 @@ Resumo (severidade geral + itens que precisam de atenção)
   └── Mudanças desde o relatório anterior
 ```
 
+Seções de coletores que não rodaram não aparecem. Seções indisponíveis mostram o motivo.
+
 ---
 
 ## Classificação de severidade
 
-| Nível | Significado | Exemplos |
-|---|---|---|
-| 🟢 Normal | Dentro do esperado | — |
-| 🟡 Atenção | Merece acompanhamento | disco acima do limite, atualizações pendentes, memória elevada, container reiniciando, certificado perto de vencer |
-| 🔴 Crítico | Pode exigir intervenção imediata | filesystem quase cheio ou somente leitura, serviço crítico parado, container essencial indisponível, interface principal fora do ar |
+| Nível | Significado |
+|---|---|
+| 🟢 Normal | Dentro do esperado |
+| 🟡 Atenção | Merece acompanhamento |
+| 🔴 Crítico | Pode exigir intervenção imediata |
 
-Os limites ficam em `config/thresholds.conf`, fora do código. Valores iniciais sugeridos (ajustáveis após os primeiros relatórios):
+Regras atuais:
+
+| Seção | 🟡 Atenção | 🔴 Crítico |
+|---|---|---|
+| Armazenamento | disco ou inodes acima do limite de atenção | disco ou inodes acima do limite crítico; filesystem somente leitura |
+| Sistema | memória acima de `MEM_WARN_PCT` | — |
+| Rede | — | sem rota padrão; interface da rota padrão em `down` |
+| Serviços | serviço em transição; serviço fora da lista em `failed` | serviço monitorado em `failed`, ou parado embora habilitado |
+| Docker | reiniciando, `unhealthy`, encerrado com erro, pausado, `dead` | container de `DOCKER_ESSENTIAL` parado ou inexistente |
+| Segurança | firewall inativo ou desconhecido; SSH com `PermitRootLogin yes` ou `PasswordAuthentication yes` | SSH com `PermitEmptyPasswords yes`; conta extra com UID 0 |
+| Atualizações | pacotes pendentes; reinicialização pendente; índice do apt velho | — |
+| Qualquer | coletor com falha; seção indisponível por `error` | — |
+
+Serviço **não instalado**, **mascarado** ou **inativo e desabilitado** não gera alarme.
+
+Os limites ficam em `config/thresholds.conf`, fora do código:
 
 ```bash
-# config/thresholds.conf
 DISK_WARN_PCT=80
 DISK_CRIT_PCT=90
 INODE_WARN_PCT=80
 INODE_CRIT_PCT=90
 MEM_WARN_PCT=85
 UPDATES_WARN_COUNT=1
+UPDATES_CACHE_WARN_DAYS=14
+DOCKER_ESSENTIAL=""        # ex.: "nginx stirling-pdf"
 ```
 
-No MVP, a classificação já é aplicada com esses limites simples; a Fase 2 a refina com a comparação histórica (por exemplo, crescimento rápido de uso de disco).
+Esse arquivo é lido como script Bash (só atribuições). Os valores acima são os padrões; ajuste depois dos primeiros relatórios.
 
 ---
 
 ## Permissões
 
-O projeto segue o princípio do **menor privilégio**: o processo roda como usuário comum, e só alguns comandos específicos recebem privilégio extra.
+O projeto segue o princípio do **menor privilégio**: o processo roda como usuário comum (`audit`), e só alguns itens recebem acesso extra.
 
 | Informação | Como é obtida |
 |---|---|
-| Informações públicas do sistema (`df`, `free`, `ss`, `systemctl`, `lsblk`…) | usuário normal |
-| Logs do journal (`journalctl`, tentativas de autenticação) | usuário no grupo `systemd-journal`, sem `sudo` |
-| Estado do firewall (`ufw status`) | `sudo` restrito a esse comando |
-| SMART (`smartctl`) | `sudo` restrito a esse comando |
+| Sistema, armazenamento, rede, serviços, atualizações, usuários e SSH | usuário normal (arquivos e comandos de leitura pública) |
+| Tentativas de login SSH (journal) | usuário no grupo `systemd-journal`, sem `sudo` |
+| Estado do firewall (`ufw status verbose`) | `sudo` restrito a esse comando |
+| Docker | usuário com acesso ao socket (grupo `docker`) |
 
-Exemplo de regra em `/etc/sudoers.d/server-audit` (editar sempre com `visudo -f`):
+Regra em `/etc/sudoers.d/server-audit` (editar sempre com `visudo -f`):
 
 ```text
 audit ALL=(root) NOPASSWD: /usr/sbin/ufw status verbose
 ```
 
-Liste **comandos completos e exatos**, sem curingas, e nunca conceda `sudo` geral ao usuário de auditoria. Se um comando exigir privilégio e ele não estiver disponível, o coletor registra a limitação no relatório em vez de falhar.
+Liste **comandos completos e exatos**, sem curingas, e nunca conceda `sudo` geral ao usuário de auditoria.
+
+> ⚠️ **Docker:** estar no grupo `docker` equivale a ter root na máquina, o que contraria o menor privilégio. Se não aceitar esse risco, deixe o usuário de fora: a seção Docker aparece como indisponível (🟡 no resumo, com o motivo).
+
+Quando algo exige privilégio e não está liberado, o coletor registra a limitação no relatório em vez de falhar.
 
 ---
 
 ## Requisitos
 
-Direcionado inicialmente a sistemas **Debian/Ubuntu**.
+Direcionado a sistemas **Debian/Ubuntu**.
 
 **Obrigatórios:**
 
 - Bash 5.0 ou superior;
-- `jq`;
+- `jq` 1.6 ou superior;
+- `flock` e `timeout` (util-linux e coreutils);
+- coreutils e utilitários padrão (`df`, `awk`, `sed`, `grep`);
 - `systemd` (`systemctl`, `journalctl`);
-- coreutils e utilitários padrão (`df`, `free`, `lsblk`);
-- `iproute2` (`ip`, `ss`).
+- `iproute2` com suporte a JSON (`ip -j`) e `ss`.
 
 **Opcionais** (a ausência não impede o relatório):
 
 - Docker;
 - UFW;
-- WireGuard;
-- smartmontools.
+- `resolvectl` (systemd-resolved);
+- `apt-get` (sem ele, a seção de atualizações fica indisponível);
+- `lsblk` (lista de discos);
+- smartmontools (reservado para a Fase 4).
+
+---
+
+## Como adicionar um coletor
+
+1. Crie `collectors/<nome>.sh` seguindo o [contrato](#contrato-de-um-coletor), com `chmod +x`. O `audit.sh` já o executa.
+2. Em `lib/render.sh`, defina:
+   - `_render_<nome> ARQUIVO_ESTADO`: imprime o corpo da seção em Markdown;
+   - `_issues_<nome> ARQUIVO_ESTADO`: imprime uma linha por problema, no formato `<sev><TAB><mensagem>` (`1` = Atenção, `2` = Crítico);
+   - e inclua o nome em `_SECTION_ORDER` e `_SECTION_TITLE`.
+3. Em `lib/compare.sh`, defina `_compare_<nome> ANTERIOR NOVO` (uma linha `- ...` por mudança) e inclua o nome em `_COMPARE_SECTIONS` e `_COMPARE_TITLE`.
+
+Sem os passos 2 e 3, o coletor roda e entra no estado, mas a seção aparece só com um aviso de "renderização não implementada".
 
 ---
 
 ## Princípios do projeto
 
 1. **Somente leitura.** A auditoria apenas consulta informações; nunca modifica configurações do servidor.
-2. **Modularidade.** Cada categoria tem seu coletor. Adicionar um novo (por exemplo, `proxmox.sh`) não exige alterar os demais.
+2. **Modularidade.** Cada categoria tem seu coletor. Adicionar um novo não exige alterar os demais nem o `audit.sh`.
 3. **Tolerância a falhas.** Um problema em um coletor não impede o relatório completo: o item aparece como "não instalado" ou "indisponível", em vez de abortar tudo.
 4. **Histórico.** Relatórios anteriores são preservados para acompanhar a evolução do servidor.
+
+---
+
+## Limitações conhecidas
+
+- **SSH:** a configuração é lida dos arquivos (`sshd_config` e `sshd_config.d/*.conf`), pois `sshd -T` exige root. É uma aproximação: blocos `Match` são ignorados e valem os padrões do OpenSSH quando a opção não aparece.
+- **Firewall:** só o `ufw` é suportado. Quem usa `nftables` ou `iptables` direto aparece como "ufw não instalado".
+- **Portas em escuta:** sem root, `ss` não informa qual processo é dono da porta.
+- **Serviços privilegiados** (item previsto para a segurança) não foram implementados, pois exigem root.
+- **Atualizações:** só `apt`. O índice não é atualizado pela ferramenta; se estiver velho, a contagem fica subestimada (o relatório avisa).
+- **Mounts somente leitura legítimos** (por exemplo, uma ISO montada) são marcados como 🔴. Se isso gerar alarme falso, será preciso uma lista de exceções.
 
 ---
 
@@ -363,42 +475,26 @@ Direcionado inicialmente a sistemas **Debian/Ubuntu**.
 
 ### Fase 1 — MVP
 
-- [ ] Criar estrutura do projeto e `.gitignore`
-- [ ] Criar `audit.sh` (detecção do host, execução dos coletores, log)
-- [ ] Criar `lib/common.sh`
-- [ ] Criar os coletores: sistema, armazenamento, rede, serviços, Docker, segurança, atualizações
-- [ ] Criar `lib/render.sh` e gerar o primeiro relatório Markdown
-- [ ] Aplicar limites de `config/thresholds.conf` (🟢/🟡/🔴)
+- [x] Criar estrutura do projeto e `.gitignore`
+- [x] Criar `audit.sh` (detecção do host, execução dos coletores, log)
+- [x] Criar os 7 coletores: sistema, armazenamento, rede, serviços, Docker, segurança, atualizações
+- [x] Gerar relatório Markdown (`lib/render.sh`)
+- [x] Aplicar limites de `config/thresholds.conf` (🟢/🟡/🔴)
+- [ ] Validar no `kait` e ajustar alarmes falsos
 
 ### Fase 2 — Histórico
 
-- [ ] Gravar estado em `state/<host>.json`
-- [ ] Criar `lib/compare.sh` e a seção de mudanças
-- [ ] Detectar novos serviços, novos containers e alterações de armazenamento
-- [ ] Refinar severidade com base no histórico
+- [x] Gravar estado em `state/<host>.json`
+- [x] Criar `lib/compare.sh` e a seção de mudanças
+- [x] Detectar mudanças de serviços, containers, armazenamento, rede, segurança e atualizações
+- [ ] Validar a comparação com duas execuções reais em dias diferentes
 
 ### Fase 3 — Automação
 
-- [ ] Criar `server-audit.service` e `server-audit.timer` (execução semanal)
-- [ ] Registrar logs no `journald`
-- [ ] Tratar falhas de execução
-
-```text
-┌─────────────────────┐
-│ systemd timer       │
-│ (semanal)           │
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ server-audit.service│
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ audit.sh            │
-└──────────┬──────────┘
-           ▼
-       relatório
-```
+- [x] Criar `server-audit.service` e `server-audit.timer` (execução semanal)
+- [x] Registrar logs no `journald` (a saída de erro do `audit.sh` vai para o journal)
+- [x] Tratar falhas de execução (código de saída `2` marca a unidade como falha)
+- [ ] Ativar o timer no `kait` depois da validação
 
 ### Fase 4 — Expansão
 
