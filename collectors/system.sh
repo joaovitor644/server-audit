@@ -102,7 +102,7 @@ jq -n -c \
       uptime_seconds: ($up | n),
       boot_epoch: ($btime | n),
       cpu: {
-        model: ($cpumodel | nz),
+        model: ($cpumodel | nz | if . then gsub("\\s+"; " ") else . end),
         cores: ($cores | n),
         load: [ $l1, $l5, $l15 | n ]
       },

@@ -10,8 +10,9 @@
 #     e saída 0
 #
 # Detalhes:
-#   - `lo` e interfaces `veth*` (criadas e destruídas pelo Docker a cada
-#     container) ficam de fora, para não gerar "mudanças" sem sentido;
+#   - `lo`, interfaces `veth*` e bridges `br-<12 hex>` (criadas e destruídas
+#     pelo Docker a cada container ou stack) ficam de fora, para não gerar
+#     "mudanças" sem sentido;
 #   - só endereços de escopo global entram (IPv6 link-local fe80:: é ignorado);
 #   - sem root, `ss` não mostra o processo dono da porta; só a porta.
 #
@@ -43,7 +44,9 @@ ipj() { ip -j "$@" 2>/dev/null; }
 
 interfaces="$(ipj addr show | jq -sc '
   (.[0] // [])
-  | map(select(.ifname != "lo" and (.ifname | startswith("veth") | not))
+  | map(select(.ifname != "lo"
+            and (.ifname | startswith("veth") | not)
+            and (.ifname | test("^br-[0-9a-f]{12}$") | not))
         | { name: .ifname,
             state: ((.operstate // "unknown") | ascii_downcase),
             addresses: [ .addr_info[]? | select(.scope == "global") | "\(.local)/\(.prefixlen)" ] })

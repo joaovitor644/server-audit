@@ -190,7 +190,10 @@ _render_services() {
       ),
       "", "### Serviços em falha", "",
       ( if (($s.failed // []) | length) == 0 then "Nenhum serviço em falha."
-        else ($s.failed[] | "- `\(.).service`") end )
+        else ($s.failed[] | "- `\(.).service`") end ),
+      ( if (($s.ignored_failed // []) | length) > 0
+        then "", "Ignorados pela configuração: \(($s.ignored_failed | map("`\(.).service`") | join(", ")))"
+        else empty end )
   ' "$1"
 }
 
@@ -282,13 +285,13 @@ def csev($ess):
   elif .state == "restarting" or .restarting == true then 1
   elif .health == "unhealthy" then 1
   elif .state == "dead" or .state == "paused" then 1
-  elif .state == "exited" and ((.exit_code // 0) != 0) then 1
+  elif .state == "exited" and ((.exit_code // 0) != 0) and ((.exited_ago_days // 0) <= $ew) then 1
   else 0 end;
 def clabel($ess):
   csev($ess) as $v
   | (if .state == "running" then "Up\(if .health != null then " (\(.health))" else "" end)"
      elif .state == "restarting" or .restarting == true then "reiniciando"
-     elif .state == "exited" then "Exited (\(.exit_code))"
+     elif .state == "exited" then "Exited (\(.exit_code))\(if (.exited_ago_days // 0) > 0 then " há \(.exited_ago_days)d" else "" end)"
      else .state end) as $t
   | (if $v == 2 then "🔴" elif $v == 1 then "🟡" elif .state == "running" then "🟢" else "" end) as $i
   | [$i, $t] | map(select(. != "")) | join(" ");
@@ -301,7 +304,7 @@ _docker_essential_json() {
 }
 
 _render_docker() {
-  jq -r --argjson ess "$(_docker_essential_json)" "$_DOCKER_JQ_DEFS"'
+  jq -r --argjson ess "$(_docker_essential_json)" --argjson ew "${DOCKER_EXIT_WARN_DAYS:-7}" "$_DOCKER_JQ_DEFS"'
     .docker as $d
     | ($d.containers // []) as $c
     | ( if ($c | length) == 0 then "Nenhum container."
@@ -315,7 +318,7 @@ _render_docker() {
 }
 
 _issues_docker() {
-  jq -r --argjson ess "$(_docker_essential_json)" "$_DOCKER_JQ_DEFS"'
+  jq -r --argjson ess "$(_docker_essential_json)" --argjson ew "${DOCKER_EXIT_WARN_DAYS:-7}" "$_DOCKER_JQ_DEFS"'
     .docker as $d
     | ($d.containers // []) as $c
     | ( ( $c[] | select(csev($ess) > 0)
@@ -323,7 +326,7 @@ _issues_docker() {
               if isess($ess) and .state != "running" then "não está em execução (estado: \(.state))"
               elif .state == "restarting" or .restarting == true then "reiniciando (\(.restart_count // 0) reinícios)"
               elif .health == "unhealthy" then "com healthcheck falhando (unhealthy)"
-              elif .state == "exited" then "encerrou com erro (código \(.exit_code))"
+              elif .state == "exited" then "encerrou com erro (código \(.exit_code))\(if .exited_ago_days != null then " há \(.exited_ago_days) dia(s)" else "" end)"
               else "em estado \(.state)" end)" ),
         ( $ess[] as $e
           | select(($c | map(.name) | index($e)) == null)
@@ -338,7 +341,7 @@ _issues_docker() {
 # ---------------------------------------------------------------------------
 
 _render_security() {
-  jq -r '
+  jq -r --argjson pw "${SSH_PASSWORD_AUTH_WARN:-1}" '
     def names($a): if ($a | length) == 0 then "nenhum"
                    else ($a | map("`\(.)`") | join(", ")) end;
     def flag($v; $bad; $icon): if $v == $bad then " \($icon)" else "" end;
@@ -346,7 +349,7 @@ _render_security() {
     .security as $s
     | "### Firewall", "",
       ( if $s.firewall.tool == "none"
-        then "- ufw não instalado (nenhum firewall gerenciado por ufw detectado)"
+        then "- ufw não instalado (só o ufw é consultado; se houver outro firewall, como nftables ou iptables, confira por fora)"
         else
           "- Firewall (ufw): \(
             if $s.firewall.status == "active" then "🟢 ativo"
@@ -363,7 +366,7 @@ _render_security() {
           "| Opção | Valor |", "|---|---|",
           "| Porta | \($s.ssh.port | map(tostring) | join(", ")) |",
           "| PermitRootLogin | \($s.ssh.permit_root_login)\(flag($s.ssh.permit_root_login; "yes"; "🟡")) |",
-          "| PasswordAuthentication | \($s.ssh.password_authentication)\(flag($s.ssh.password_authentication; "yes"; "🟡")) |",
+          "| PasswordAuthentication | \($s.ssh.password_authentication)\(if $pw == 1 then flag($s.ssh.password_authentication; "yes"; "🟡") else "" end) |",
           "| PubkeyAuthentication | \($s.ssh.pubkey_authentication) |",
           "| PermitEmptyPasswords | \($s.ssh.permit_empty_passwords)\(flag($s.ssh.permit_empty_passwords; "yes"; "🔴")) |",
           "| X11Forwarding | \($s.ssh.x11_forwarding) |"
@@ -391,7 +394,7 @@ _render_security() {
 }
 
 _issues_security() {
-  jq -r '
+  jq -r --argjson pw "${SSH_PASSWORD_AUTH_WARN:-1}" '
     .security as $s
     | ( if $s.firewall.status == "inactive" then "1\tFirewall (ufw) inativo" else empty end ),
       ( if $s.firewall.tool == "ufw" and $s.firewall.status == "unknown"
@@ -402,7 +405,7 @@ _issues_security() {
             then "2\tSSH permite senhas vazias (PermitEmptyPasswords yes)" else empty end ),
           ( if $s.ssh.permit_root_login == "yes"
             then "1\tSSH permite login direto como root com senha (PermitRootLogin yes)" else empty end ),
-          ( if $s.ssh.password_authentication == "yes"
+          ( if $pw == 1 and $s.ssh.password_authentication == "yes"
             then "1\tSSH aceita autenticação por senha (PasswordAuthentication yes)" else empty end )
         else empty end ),
       ( ($s.users.uid0_extra // [])[] | "2\tConta `\(.)` com UID 0 além de root" )

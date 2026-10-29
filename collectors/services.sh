@@ -10,6 +10,8 @@
 #
 # Quais serviços são monitorados:
 #   - os listados em config/services.conf (um por linha, '#' para comentários);
+#     linhas com "!" (ex.: !systemd-networkd-wait-online) tiram aquele serviço
+#     da lista de falhas;
 #   - se o arquivo não existir ou estiver vazio, a lista padrão abaixo.
 #   Serviço não instalado não é problema: aparece como "não instalado".
 #
@@ -20,7 +22,8 @@
 #       { "name": "ssh", "load": "loaded", "active": "active",
 #         "sub": "running", "enabled": "enabled" }
 #     ],
-#     "failed": ["example"]          // nomes sem o sufixo .service
+#     "failed": ["example"],         // nomes sem o sufixo .service
+#     "ignored_failed": []           // em falha, mas ignorados via !
 #   }
 
 set -uo pipefail
@@ -46,11 +49,16 @@ script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 conf="$script_dir/../config/services.conf"
 
 services=()
+ignore=()
 if [[ -r $conf ]]; then
   while IFS= read -r line; do
     line="${line%%#*}"
     line="${line//[[:space:]]/}"
-    if [[ -n $line ]]; then
+    [[ -n $line ]] || continue
+    if [[ $line == '!'* ]]; then
+      line="${line#!}"
+      ignore+=("${line%.service}")
+    else
       services+=("$line")
     fi
   done <"$conf"
@@ -77,10 +85,22 @@ for svc in "${services[@]}"; do
   rows+="${unit%.service}"$'\t'"$load"$'\t'"$active"$'\t'"$sub"$'\t'"$enabled"$'\n'
 done
 
-failed="$(systemctl list-units --type=service --state=failed --no-legend --plain --no-pager 2>/dev/null \
+failed_all="$(systemctl list-units --type=service --state=failed --no-legend --plain --no-pager 2>/dev/null \
   | awk 'NF { sub(/\.service$/, "", $1); print $1 }')"
 
-jq -n -c --arg rows "$rows" --arg failed "$failed" '
+# Serviços em falha marcados com "!" no services.conf não geram alarme, mas
+# continuam registrados em "ignored_failed" para ficar transparente.
+failed="" ignored=""
+while IFS= read -r unit_name; do
+  [[ -n $unit_name ]] || continue
+  if [[ " ${ignore[*]:-} " == *" $unit_name "* ]]; then
+    ignored+="$unit_name"$'\n'
+  else
+    failed+="$unit_name"$'\n'
+  fi
+done <<<"$failed_all"
+
+jq -n -c --arg rows "$rows" --arg failed "$failed" --arg ignored "$ignored" '
   def lines: split("\n") | map(select(length > 0));
   def nz: if . == "" then null else . end;
   {
@@ -95,6 +115,7 @@ jq -n -c --arg rows "$rows" --arg failed "$failed" '
           enabled: (.[4] | nz)
         })
     ),
-    failed: ($failed | lines | sort)
+    failed: ($failed | lines | sort),
+    ignored_failed: ($ignored | lines | sort)
   }
 ' || unavailable "falha ao montar a saída JSON"

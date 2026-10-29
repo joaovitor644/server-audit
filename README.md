@@ -223,8 +223,8 @@ Os coletores são **descobertos automaticamente** em `collectors/*.sh`: adiciona
 |---|---|---|
 | `system.sh` | hostname, SO e versão, kernel, arquitetura, uptime, horário do boot, CPU (modelo, núcleos, carga), memória e swap | lê direto de `/proc`; memória "em uso" desconta o cache (`MemAvailable`) |
 | `storage.sh` | filesystems, uso de disco e inodes, espaço disponível, montagem somente leitura, discos | ignora os filesystems `tmpfs`, `squashfs` e `overlay` e os discos `zram` |
-| `network.sh` | interfaces e estado, endereços, rotas, gateway padrão, DNS, portas TCP/UDP em escuta | ignora `lo` e `veth*`; usa `resolvectl` quando existe |
-| `services.sh` | estado dos serviços de `config/services.conf` e lista de serviços em `failed` | padrão: `ssh`, `docker`, `nginx`, `cron` |
+| `network.sh` | interfaces e estado, endereços, rotas, gateway padrão, DNS, portas TCP/UDP em escuta | ignora `lo`, `veth*` e as bridges `br-<hash>` do Docker; usa `resolvectl` quando existe |
+| `services.sh` | estado dos serviços de `config/services.conf` e lista de serviços em `failed` | padrão: `ssh`, `docker`, `nginx`, `cron`; linhas `!nome` no `services.conf` ignoram uma falha conhecida |
 | `docker.sh` | containers (estado, imagem, reinícios, healthcheck), imagens, volumes, redes | Docker ausente: seção diz "não instalado" |
 | `security.sh` | firewall (`ufw`), configuração do SSH, usuários com shell, administradores, tentativas de login SSH (7 dias), fail2ban, unattended-upgrades | veja [Permissões](#permissões) |
 | `updates.sh` | pacotes com atualização pendente, quantos são de segurança, reinicialização pendente, idade do índice do apt | simula `apt-get dist-upgrade`; não instala nada |
@@ -365,12 +365,12 @@ Regras atuais:
 | Sistema | memória acima de `MEM_WARN_PCT` | — |
 | Rede | — | sem rota padrão; interface da rota padrão em `down` |
 | Serviços | serviço em transição; serviço fora da lista em `failed` | serviço monitorado em `failed`, ou parado embora habilitado |
-| Docker | reiniciando, `unhealthy`, encerrado com erro, pausado, `dead` | container de `DOCKER_ESSENTIAL` parado ou inexistente |
-| Segurança | firewall inativo ou desconhecido; SSH com `PermitRootLogin yes` ou `PasswordAuthentication yes` | SSH com `PermitEmptyPasswords yes`; conta extra com UID 0 |
+| Docker | reiniciando, `unhealthy`, pausado, `dead`, ou encerrado com erro **há até `DOCKER_EXIT_WARN_DAYS` dias** | container de `DOCKER_ESSENTIAL` parado ou inexistente |
+| Segurança | firewall inativo ou desconhecido; SSH com `PermitRootLogin yes` ou `PasswordAuthentication yes` (este desligável com `SSH_PASSWORD_AUTH_WARN=0`) | SSH com `PermitEmptyPasswords yes`; conta extra com UID 0 |
 | Atualizações | pacotes pendentes; reinicialização pendente; índice do apt velho | — |
 | Qualquer | coletor com falha; seção indisponível por `error` | — |
 
-Serviço **não instalado**, **mascarado** ou **inativo e desabilitado** não gera alarme.
+Serviço **não instalado**, **mascarado** ou **inativo e desabilitado** não gera alarme. Container parado há mais de `DOCKER_EXIT_WARN_DAYS` dias também não: o relatório só mostra "Exited (137) há 40d", sem 🟡. Falhas conhecidas de serviço podem ser silenciadas com `!nome` no `services.conf`.
 
 Os limites ficam em `config/thresholds.conf`, fora do código:
 
@@ -383,6 +383,8 @@ MEM_WARN_PCT=85
 UPDATES_WARN_COUNT=1
 UPDATES_CACHE_WARN_DAYS=14
 DOCKER_ESSENTIAL=""        # ex.: "nginx stirling-pdf"
+DOCKER_EXIT_WARN_DAYS=7    # container parado com erro só alarma se parou há até N dias
+SSH_PASSWORD_AUTH_WARN=1   # 0 = não marcar 🟡 por PasswordAuthentication yes
 ```
 
 Esse arquivo é lido como script Bash (só atribuições). Os valores acima são os padrões; ajuste depois dos primeiros relatórios.
@@ -467,6 +469,7 @@ Sem os passos 2 e 3, o coletor roda e entra no estado, mas a seção aparece só
 - **Portas em escuta:** sem root, `ss` não informa qual processo é dono da porta.
 - **Serviços privilegiados** (item previsto para a segurança) não foram implementados, pois exigem root.
 - **Atualizações:** só `apt`. O índice não é atualizado pela ferramenta; se estiver velho, a contagem fica subestimada (o relatório avisa).
+- **Container parado:** o Docker não diferencia "parou com `docker stop`" de "caiu" (ambos podem sair com 137). Por isso o alarme depende de **quando** o container parou; para o que não pode cair, use `DOCKER_ESSENTIAL`.
 - **Mounts somente leitura legítimos** (por exemplo, uma ISO montada) são marcados como 🔴. Se isso gerar alarme falso, será preciso uma lista de exceções.
 
 ---
