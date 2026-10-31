@@ -4,9 +4,8 @@ Ferramenta em Bash para coleta periódica de informações sobre o estado de ser
 
 O objetivo é fornecer uma visão consolidada do estado atual de cada servidor e permitir identificar **mudanças e possíveis problemas ao longo do tempo**, sem precisar comparar relatórios manualmente.
 
-Servidores atendidos inicialmente: `kait` e `kara`.
 
-🚧 **Status:** código das Fases 1 (MVP), 2 (histórico) e 3 (automação) escrito e testado em ambiente de teste. Falta validar em um servidor real, começando pelo `kait`.
+🚧 **Status:** código das Fases 1 (MVP), 2 (histórico) e 3 (automação) escrito e testado em ambiente de teste. Falta validar em um servidor real.
 
 ---
 
@@ -206,9 +205,9 @@ server-audit/
 │   └── server-audit.timer
 │
 ├── reports/                # histórico (não versionado)
-│   └── kait/2026-10-13.md
+│   └── server/2026-10-13.md
 ├── state/                  # último estado de cada servidor (não versionado)
-│   └── kait.json
+│   └── server.json
 └── logs/
     └── audit.log           # (não versionado)
 ```
@@ -264,7 +263,7 @@ O estado é o JSON consolidado da última execução em `state/<host>.json`, com
 ```json
 {
   "schema": 1,
-  "hostname": "kait",
+  "hostname": "server",
   "collected_at": "2026-10-13T09:00:00-03:00",
   "failed_collectors": [],
   "system":   { "available": true, "kernel": "6.1.0-25-amd64", "memory": { "used_pct": 47 } },
@@ -483,7 +482,6 @@ Sem os passos 2 e 3, o coletor roda e entra no estado, mas a seção aparece só
 - [x] Criar os 7 coletores: sistema, armazenamento, rede, serviços, Docker, segurança, atualizações
 - [x] Gerar relatório Markdown (`lib/render.sh`)
 - [x] Aplicar limites de `config/thresholds.conf` (🟢/🟡/🔴)
-- [ ] Validar no `kait` e ajustar alarmes falsos
 
 ### Fase 2 — Histórico
 
@@ -497,7 +495,6 @@ Sem os passos 2 e 3, o coletor roda e entra no estado, mas a seção aparece só
 - [x] Criar `server-audit.service` e `server-audit.timer` (execução semanal)
 - [x] Registrar logs no `journald` (a saída de erro do `audit.sh` vai para o journal)
 - [x] Tratar falhas de execução (código de saída `2` marca a unidade como falha)
-- [ ] Ativar o timer no `kait` depois da validação
 
 ### Fase 4 — Expansão
 
@@ -510,7 +507,7 @@ Sem os passos 2 e 3, o coletor roda e entra no estado, mas a seção aparece só
 
 ### Fase 5 — Centralização
 
-Reunir os relatórios de vários servidores em um só lugar, com possível integração futura ao **Kait Control**.
+Reunir os relatórios de vários servidores em um só lugar
 
 ```text
        ┌──────────────────────────┐
@@ -518,6 +515,6 @@ Reunir os relatórios de vários servidores em um só lugar, com possível integ
        └────────────┬─────────────┘
           ┌─────────┴─────────┐
        ┌──▼───┐            ┌──▼───┐
-       │ kait │            │ kara │
+       │server2│           │server1 │
        └──────┘            └──────┘
 ```
